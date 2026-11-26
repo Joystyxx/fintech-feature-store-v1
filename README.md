@@ -1,114 +1,99 @@
-\# Fintech Feature Store v1
+# Fintech Feature Store & Fraud Risk Engine (DuckDB + Redis + Streamlit)
 
+This repository contains an end-to-end MLOps pipeline that ingests raw fintech data, builds a Dual-Store Feature Store (Offline Parquet + Online Redis), enforces a CI/CD parity gate to eliminate Train/Serve Skew, and deploys an interactive Streamlit dashboard for real-time fraud inference.
 
+The goal of this project is not just to serve features, but to prove an understanding of the full ML lifecycle—from schema conforming and point-in-time temporal joins to low-latency caching, model serving, and operational runbooks.
 
-A production-grade prototype of a Dual-Store Feature Store architecture, built to eliminate Train/Serve Skew for a fintech fraud model.
+**Live Demo:** [https://fintech-feature-store-v1.streamlit.app/](https://fintech-feature-store-v1.streamlit.app/)
 
+## Architecture
 
+1. **Define:** An immutable `registry.py` acts as the single source of truth for all 25 features, dictating types, freshness SLAs, and source paths.
+2. **Ingest:** A script downloads real Kaggle fintech data, maps the messy schema to our data contract, and writes it to Parquet files.
+3. **Offline Store:** DuckDB queries Parquet files using `ASOF JOIN` to guarantee point-in-time correctness for training (preventing data leakage).
+4. **Materialize:** A batch job queries the latest state from DuckDB and writes it to Redis for low-latency serving.
+5. **Parity Gate:** A Pytest suite compares the Offline (DuckDB) and Online (Redis) values at the exact same timestamp to detect skew.
+6. **Serve:** A Streamlit UI queries Redis, verifies parity, and runs a heuristic rules engine to approve or block transactions.
 
-\*\*Live Demo:\*\* (https://fintech-feature-store-v1.streamlit.app/)
+## Tech Stack
 
-\*\*Architecture Design Doc:\*\* See `DESIGN\_DOC.md`
+- **Offline Store:** DuckDB 2.0, Parquet, Pandas
+- **Online Store:** Redis (`fakeredis` for local testing)
+- **Serving Layer:** Streamlit
+- **Testing:** Pytest
+- **Environment:** Python 3.14 (Windows/Linux), `uv` package installer (on Streamlit Cloud)
 
-\*\*Migration Plan:\*\* See `MIGRATION\_PLAN.md`
+## Key Engineering Decisions
 
+- **Point-in-Time Correctness (The `ASOF JOIN`):** Standard SQL joins in a training pipeline cause catastrophic data leakage (e.g., a transaction at 2:00 PM seeing feature values calculated at 3:00 PM). We use DuckDB's `ASOF JOIN` (`label_timestamp >= event_timestamp`) to ensure the model only sees data that existed exactly at the time of the transaction.
+- **Idempotency in the Batch Pipeline:** During the initial build, looping through multiple feature families caused a `CatalogException: Table already exists`. We refactored the SQL to use `CREATE OR REPLACE TEMP TABLE` to ensure the materialization pipeline is fully idempotent. If an Airflow job fails and retries, it will not crash.
+- **The Null-Safety Contract:** If a feature fails to materialize (e.g., the Redis sync lags), the FastAPI layer must not silently impute `0`, which would skew the model. The API explicitly returns a `missing[]` array. The ML model consumes this array to differentiate between "zero transactions" and "data unavailable."
+- **Schema Conforming:** The Kaggle dataset is messy. We built an ingestion adapter that maps the raw schema (e.g., `transactions_last_1h`, `account_age_months`) into the exact data contract required by the Registry (e.g., `txn_count_1h`, `account_age_days`). 
 
+## Parity Gate Results
 
-\## The Problem
+The core defense against Train/Serve Skew is the CI Parity Gate (`tests/test_parity.py`). It runs on every deployment. It samples users, queries the Offline and Online stores at the same timestamp, and asserts they match.
 
-The fintech's data team was copy-pasting feature SQL across offline training notebooks and the online scoring service. This resulted in two production incidents this quarter caused by \*\*Train/Serve Skew\*\*—the model learned a data distribution in training that it never saw in production.
+| Entity ID | Feature | As-Of Timestamp | Offline Value | Online Value | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| CUST01014 | `txn_count_1h` | 2024-10-13T11:11:25 | 3 | 3 | ✅ PASS |
+| CUST01014 | `sum_amount_24h` | 2024-10-13T11:11:25 | 80.03 | 80.03 | ✅ PASS |
+| CUST00542 | `txn_count_1h` | 2024-12-17T02:05:42 | 0 | 0 | ✅ PASS |
+| CUST01192 | `ip_risk_score` | 2024-08-14T09:36:44 | 0.5 | 0.5 | ✅ PASS |
 
+If the pipeline detects a drift of even `1e-6` on a float, the build fails and the PR is blocked from merging.
 
+## Limitations & Next Steps
 
-\## The Solution
+- **Migration:** The Fraud model is fully migrated. A phased 5-month plan for the remaining 17 fintech models (Credit, Pricing) is documented in `MIGRATION_PLAN.md`.
+- **Streaming:** The current v1 uses batch materialization (Parquet to Redis). A v2 architecture would transition to a Kappa architecture using Debezium (CDC), Kafka, and Flink for true sub-second streaming updates.
+- **Infrastructure:** The prototype uses `fakeredis` for local portability. Production requires a highly available Redis cluster (e.g., AWS ElastiCache) with TTL policies enforcing freshness SLAs.
 
-We implemented a lightweight Feature Store that acts as the single source of truth. Instead of two pipelines (one for training, one for serving), we enforce a \*\*Dual-Store\*\* pattern with a hard CI parity gate.
+## How to Run
 
+**1. Prerequisites**
+- Python 3.11+ (Verified on 3.14.10)
 
+**2. Setup**
 
-\*   \*\*Feature Registry (`features/registry.py`):\*\* An immutable data contract. If a feature isn't defined here, it cannot be trained or served.
+    git clone https://github.com/Joystyxx/fintech-feature-store-v1.git
+    cd fintech-feature-store-v1
 
-\*   \*\*Offline Store (DuckDB + Parquet):\*\* Historical data is queried using `ASOF JOIN` to guarantee Point-in-Time correctness. This prevents temporal data leakage during model training.
+    python -m venv .venv
+    .venv\Scripts\activate     # Windows
+    # source .venv/bin/activate  # macOS/Linux
 
-\*   \*\*Online Store (Redis):\*\* A batch materialization job writes the latest feature state to Redis for sub-10ms real-time serving.
+    pip install -r requirements.txt
 
-\*   \*\*Parity Gate (`tests/test\_parity.py`):\*\* A Pytest suite that compares the Offline and Online values for the same entity at the same timestamp. If they drift by even `1e-6`, the CI pipeline blocks the deployment.
+**3. Generate the Data**
+Downloads the real Kaggle dataset and conforms it to our Parquet schema.
 
-\*   \*\*Serving Layer (Streamlit):\*\* An interactive dashboard that demonstrates the pipeline in action, including a heuristic rules engine for risk scoring.
+    python -m scripts.generate_data
 
+**4. Run the Parity Gate (CI/CD Test)**
+Proves that Offline and Online features match.
 
+    python -m pytest tests/test_parity.py -s
 
-\## Stack \& Tooling
+**5. Launch the Dashboard**
 
-\*   \*\*Offline Store:\*\* DuckDB, Parquet, Pandas
+    python -m streamlit run app.py
 
-\*   \*\*Online Store:\*\* Redis (`fakeredis` for local testing)
+## Repository Structure
 
-\*   \*\*Serving Layer:\*\* Streamlit
-
-\*   \*\*Testing:\*\* Pytest
-
-
-
-\## Local Setup
-
-
-
-1\.  \*\*Clone the repo and navigate into it:\*\*
-
-&#x20;   ```bash
-
-&#x20;   git clone https://github.com/Joystyxx/fintech-feature-store-v1.git
-
-&#x20;   cd fintech-feature-store-v1
-
-
-
-2\. Create a virtual environment:
-
-python -m venv .venv
-
-\# Windows: .venv\\Scripts\\activate
-
-\# Mac/Linux: source .venv/bin/activate
-
-
-
-3\. Install dependencies:
-
-pip install -r requirements.txt
-
-
-
-4\. Generate the real Kaggle data:
-
-python -m scripts.generate\_data
-
-
-
-5\. Run the Parity Gate (CI/CD Test):
-
-python -m pytest tests/test\_parity.py -s
-
-
-
-6\. Launch the Dashboard:
-
-python -m streamlit run app.py
-
-
-
-Next Steps (v2)
-
-Migration: Phased migration of the remaining 17 models over 5 months (See MIGRATION\_PLAN.md).
-
-
-
-Streaming: Transition from batch Parquet to a Kappa architecture using Debezium (CDC), Kafka, and Flink for true real-time feature computation.
-
-
-
-Infrastructure: Replace fakeredis with a production-grade Redis cluster (AWS ElastiCache / Upstash).
-
-
-
+    .
+    ├── features/
+    │   ├── registry.py           # Immutable data contract (25 features)
+    │   ├── offline.py            # DuckDB ASOF joins for training
+    │   ├── online.py             # Redis read/write & materialization
+    │   └── serve.py              # FastAPI null-safety contract
+    ├── scripts/
+    │   ├── generate_data.py      # Kaggle ingestion & schema conforming
+    │   └── generate_report.py    # Automated parity report generation
+    ├── tests/
+    │   └── test_parity.py        # CI/CD gate comparing offline vs online
+    ├── app.py                    # Streamlit interactive UI
+    ├── DESIGN_DOC.md             # 5-page architecture specification
+    ├── MIGRATION_PLAN.md         # Plan for migrating the remaining 17 models
+    ├── RUNBOOK.md                # SOP for adding new features
+    └── requirements.txt
