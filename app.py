@@ -1,16 +1,84 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import time
 import os
-import subprocess
+import urllib.request
+import zipfile
+import io
 from features.offline import get_historical_features
 from features.online import materialize, read_online
 
-# --- CLOUD BOOT FIX ---
-# This ensures the data exists on Streamlit Cloud where the data/ folder is ignored
-if not os.path.exists('data/velocity.parquet'):
-    with st.spinner("Booting cloud environment: Downloading Kaggle data (this takes 1-2 mins)..."):
-        subprocess.run(["python", "-m", "scripts.generate_data"], check=True)
+# --- CLOUD BOOT FIX (Inline Data Generation) ---
+@st.cache_resource
+def boot_data():
+    if not os.path.exists('data/velocity.parquet'):
+        with st.spinner("Booting cloud environment: Downloading Kaggle data..."):
+            os.makedirs("data", exist_ok=True)
+            url = "https://www.kaggle.com/api/v1/datasets/download/colabsss/financial-fraud-transaction-analytics"
+            
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req) as response:
+                    zip_data = io.BytesIO(response.read())
+                
+                with zipfile.ZipFile(zip_data) as z:
+                    csv_filename = [f for f in z.namelist() if f.endswith('.csv')][0]
+                    with z.open(csv_filename) as f:
+                        df = pd.read_csv(f)
+            except Exception as e:
+                st.error(f"Failed to download real data: {e}")
+                st.stop()
+
+            # --- SCHEMA MAPPING ---
+            df['event_timestamp'] = pd.to_datetime(df['transaction_datetime'])
+
+            # Velocity
+            velocity_df = df[['customer_id', 'event_timestamp']].copy()
+            velocity_df['txn_count_1h'] = df.get('transactions_last_1h', 0)
+            velocity_df['txn_count_24h'] = df.get('transactions_last_24h', 0)
+            velocity_df['txn_count_7d'] = df.get('transactions_last_7d', 0)
+            velocity_df['txn_count_5m'] = (df.get('transactions_last_1h', 0) / 12).round().astype(int)
+            velocity_df['distinct_devices_24h'] = 1
+            velocity_df['failed_txn_count_1h'] = df.get('failed_login_attempts', 0)
+            velocity_df['declined_ratio_24h'] = 0.0
+            velocity_df['distinct_countries_7d'] = 1
+            velocity_df.to_parquet("data/velocity.parquet", index=False)
+
+            # Amounts
+            amounts_df = df[['customer_id', 'event_timestamp']].copy()
+            amounts_df['sum_amount_24h'] = df.get('transaction_amount', 0.0)
+            amounts_df['avg_amount_7d'] = df.get('average_transaction_amount_30d', 0.0)
+            amounts_df['max_amount_30d'] = df.get('transaction_amount', 0.0)
+            amounts_df['amount_zscore_30d'] = 0.0
+            amounts_df['std_amount_7d'] = 0.0
+            amounts_df['avg_txn_amount_1h'] = df.get('transaction_amount', 0.0)
+            amounts_df.to_parquet("data/amounts.parquet", index=False)
+
+            # Profile
+            profile_df = df[['customer_id']].copy().drop_duplicates()
+            profile_df['event_timestamp'] = df['event_timestamp'].min()
+            profile_df['account_age_days'] = (df.get('account_age_months', 0) * 30).astype(int)
+            profile_df['kyc_tier'] = 1
+            profile_df['risk_segment'] = 'Low'
+            profile_df['country_risk_score'] = df.get('ip_risk_level', 'Low').map({'Low': 0.1, 'Medium': 0.5, 'High': 0.9}).fillna(0.1)
+            profile_df['credit_limit'] = df.get('account_balance', 0.0)
+            profile_df['is_pep'] = 0
+            profile_df.to_parquet("data/profile.parquet", index=False)
+
+            # Device
+            device_df = df[['customer_id', 'event_timestamp']].copy()
+            device_df['device_age_days'] = 1
+            device_df['shared_device_count'] = 1
+            device_df['counterparty_risk_avg'] = 0.1
+            device_df['device_change_count_7d'] = 0
+            device_df['ip_risk_score'] = df.get('ip_risk_level', 'Low').map({'Low': 0.1, 'Medium': 0.5, 'High': 0.9}).fillna(0.1)
+            device_df.to_parquet("data/device.parquet", index=False)
+
+            pd.DataFrame({"customer_id": [], "event_timestamp": [], "counterparty_risk_avg": []}).to_parquet("data/graph.parquet")
+    return True
+
+boot_data()
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Fintech Risk Engine", page_icon="💳", layout="wide")
@@ -18,58 +86,28 @@ st.set_page_config(page_title="Fintech Risk Engine", page_icon="💳", layout="w
 # --- CUSTOM CSS ---
 st.markdown("""
     <style>
-    /* Title styling */
     .main-title { font-size: 32px !important; font-weight: 700; margin-bottom: 0px; }
     .sub-title { font-size: 16px; opacity: 0.7; margin-bottom: 20px; }
-    
-    /* Custom Metric Cards */
-    .metric-card {
-        background-color: rgba(128, 128, 128, 0.1);
-        padding: 20px;
-        border-radius: 12px;
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        text-align: center;
-    }
+    .metric-card { background-color: rgba(128, 128, 128, 0.1); padding: 20px; border-radius: 12px; border: 1px solid rgba(128, 128, 128, 0.2); text-align: center; }
     .metric-value { font-size: 28px; font-weight: 700; }
     .metric-label { font-size: 14px; opacity: 0.7; text-transform: uppercase; letter-spacing: 1px; }
-    
-    /* Button styling */
-    .stButton>button {
-        width: 100%;
-        background-color: #2563EB !important;
-        color: #FFFFFF !important;
-        font-weight: 600;
-        border-radius: 8px;
-        height: 48px;
-        border: none;
-        transition: all 0.2s;
-    }
-    .stButton>button:hover { 
-        background-color: #1D4ED8 !important; 
-    }
+    .stButton>button { width: 100%; background-color: #2563EB !important; color: #FFFFFF !important; font-weight: 600; border-radius: 8px; height: 48px; border: none; transition: all 0.2s; }
+    .stButton>button:hover { background-color: #1D4ED8 !important; }
     </style>
 """, unsafe_allow_html=True)
 
 # --- DATA INITIALIZATION ---
 @st.cache_resource
 def init_redis():
-    # 1. Ensure data exists before doing anything
-    if not os.path.exists('data/velocity.parquet'):
-        with st.spinner("Booting cloud environment: Downloading Kaggle data (this takes 1-2 mins)..."):
-            import scripts.generate_data  # Runs the data generation directly
-
-    # 2. Now that data is guaranteed to exist, materialize to Redis
     features = ['txn_count_1h', 'sum_amount_24h', 'avg_amount_7d', 'ip_risk_score']
     materialize(features)
     return True
-
 init_redis()
 
 @st.cache_data
 def load_customer_ids():
     df = pd.read_parquet('data/velocity.parquet')
     return sorted(df['customer_id'].unique())
-
 customer_ids = load_customer_ids()
 
 # --- HEADER ---
@@ -82,7 +120,6 @@ with st.sidebar:
     st.header("Transaction Input")
     selected_customer = st.selectbox("Select Customer ID", customer_ids)
     transaction_amount = st.number_input("Incoming Amount ($)", min_value=1.0, value=250.0, step=10.0)
-    
     st.markdown("---")
     run_btn = st.button("Run Live Inference")
 
@@ -90,13 +127,10 @@ with st.sidebar:
 if run_btn:
     with st.spinner("Executing Temporal Joins and Cache Lookups..."):
         time.sleep(1)
-        
         features_to_fetch = ['txn_count_1h', 'sum_amount_24h', 'avg_amount_7d', 'ip_risk_score']
         
-        # 1. Fetch Online
         online_features = read_online("customer_id", selected_customer, features_to_fetch)
         
-        # 2. Fetch Offline
         df_raw = pd.read_parquet('data/velocity.parquet')
         user_data = df_raw[df_raw['customer_id'] == selected_customer]
         latest_ts = user_data['event_timestamp'].max()
@@ -105,7 +139,7 @@ if run_btn:
         offline_df = get_historical_features(entity_df, features_to_fetch)
         offline_features = offline_df.iloc[0].to_dict()
 
-        # 3. PARITY GATE
+        # PARITY GATE
         parity_passed = True
         for f in features_to_fetch:
             off = offline_features.get(f)
@@ -115,10 +149,9 @@ if run_btn:
             elif off != on:
                 parity_passed = False
 
-        # --- UI RENDER ---
+        # UI RENDER
         st.markdown("### Feature Store Lookup")
         c1, c2 = st.columns(2)
-        
         with c1:
             st.info("⚡ **Online Store (Redis)**")
             st.json(online_features)
@@ -134,30 +167,24 @@ if run_btn:
 
         st.divider()
 
-        # --- MODEL INFERENCE (Heuristic Rules Engine) ---
+        # MODEL INFERENCE
         st.markdown("### Model Inference")
-        
-        # Business Rules
         risk_score = 0
         triggers = []
         
-        # Rule 1: High Velocity
         if online_features.get('txn_count_1h', 0) > 3: 
             risk_score += 30
             triggers.append("High 1H Velocity")
             
-        # Rule 2: Incoming Amount vs Historical Average
         avg_amt = online_features.get('avg_amount_7d', 100)
         if transaction_amount > avg_amt * 3:
             risk_score += 40
             triggers.append("Amount > 3x 7-day Avg")
             
-        # Rule 3: High IP Risk
         if online_features.get('ip_risk_score', 0) > 0.5: 
             risk_score += 30
             triggers.append("High IP Risk Score")
 
-        # Metric Cards
         m1, m2, m3 = st.columns(3)
         with m1:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Incoming Amount</div><div class="metric-value">${transaction_amount:,.2f}</div></div>', unsafe_allow_html=True)
@@ -167,8 +194,6 @@ if run_btn:
             st.markdown(f'<div class="metric-card"><div class="metric-label">Fraud Risk Score</div><div class="metric-value">{risk_score}/100</div></div>', unsafe_allow_html=True)
 
         st.write("") 
-
-        # Final Decision
         if risk_score >= 50:
             st.error(f"🚨 **TRANSACTION BLOCKED** — High probability of fraud ({risk_score}% Risk).")
             st.caption(f"Triggered Rules: {', '.join(triggers)}")
