@@ -1,8 +1,16 @@
 import streamlit as st
 import pandas as pd
 import time
+import os
+import subprocess
 from features.offline import get_historical_features
 from features.online import materialize, read_online
+
+# --- CLOUD BOOT FIX ---
+# This ensures the data exists on Streamlit Cloud where the data/ folder is ignored
+if not os.path.exists('data/velocity.parquet'):
+    with st.spinner("Booting cloud environment: Downloading Kaggle data (this takes 1-2 mins)..."):
+        subprocess.run(["python", "-m", "scripts.generate_data"], check=True)
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Fintech Risk Engine", page_icon="💳", layout="wide")
@@ -45,6 +53,17 @@ st.markdown("""
 # --- DATA INITIALIZATION ---
 @st.cache_resource
 def init_redis():
+    # 1. Ensure data exists before doing anything
+    if not os.path.exists('data/velocity.parquet'):
+        with st.spinner("Booting cloud environment: Downloading Kaggle data (this takes 1-2 mins)..."):
+            import subprocess
+            # We run the generation script synchronously and print the output if it fails
+            result = subprocess.run(["python", "-m", "scripts.generate_data"], capture_output=True, text=True)
+            if result.returncode != 0:
+                st.error(f"Data generation failed! Error: {result.stderr}")
+                st.stop()
+
+    # 2. Now that data is guaranteed to exist, materialize to Redis
     features = ['txn_count_1h', 'sum_amount_24h', 'avg_amount_7d', 'ip_risk_score']
     materialize(features)
     return True
