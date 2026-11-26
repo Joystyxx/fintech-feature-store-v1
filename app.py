@@ -56,12 +56,7 @@ def init_redis():
     # 1. Ensure data exists before doing anything
     if not os.path.exists('data/velocity.parquet'):
         with st.spinner("Booting cloud environment: Downloading Kaggle data (this takes 1-2 mins)..."):
-            import subprocess
-            # We run the generation script synchronously and print the output if it fails
-            result = subprocess.run(["python", "-m", "scripts.generate_data"], capture_output=True, text=True)
-            if result.returncode != 0:
-                st.error(f"Data generation failed! Error: {result.stderr}")
-                st.stop()
+            import scripts.generate_data  # Runs the data generation directly
 
     # 2. Now that data is guaranteed to exist, materialize to Redis
     features = ['txn_count_1h', 'sum_amount_24h', 'avg_amount_7d', 'ip_risk_score']
