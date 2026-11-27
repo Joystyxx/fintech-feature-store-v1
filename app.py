@@ -172,15 +172,21 @@ if run_btn:
         risk_score = 0
         triggers = []
         
+        # Rule 1: Velocity
         if online_features.get('txn_count_1h', 0) > 3: 
             risk_score += 30
             triggers.append("High 1H Velocity")
             
+        # Rule 2: Amount Deviation (FIXED)
         avg_amt = online_features.get('avg_amount_7d', 100)
-        if transaction_amount > avg_amt * 3:
-            risk_score += 40
-            triggers.append("Amount > 3x 7-day Avg")
+        if transaction_amount > avg_amt * 5:
+            risk_score += 60  # Instant block if > 5x average
+            triggers.append("Amount > 5x 7-day Avg")
+        elif transaction_amount > avg_amt * 2:
+            risk_score += 30  # Flag if > 2x average
+            triggers.append("Amount > 2x 7-day Avg")
             
+        # Rule 3: IP Risk
         if online_features.get('ip_risk_score', 0) > 0.5: 
             risk_score += 30
             triggers.append("High IP Risk Score")
