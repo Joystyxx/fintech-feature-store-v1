@@ -139,17 +139,30 @@ if run_btn:
         offline_df = get_historical_features(entity_df, features_to_fetch)
         offline_features = offline_df.iloc[0].to_dict()
 
-        # PARITY GATE
+        # --- PARITY GATE (Null-Safe) ---
         parity_passed = True
+        failed_features = []
+        
         for f in features_to_fetch:
             off = offline_features.get(f)
             on = online_features.get(f)
-            if isinstance(off, float):
-                if abs(off - on) > 1e-6: parity_passed = False
+            
+            # Safely handle missing values
+            if off is None or on is None:
+                parity_passed = False
+                failed_features.append(f)
+                continue
+
+            # Safely handle floats (including numpy types)
+            if isinstance(off, (float, np.floating)) or isinstance(on, (float, np.floating)):
+                if abs(float(off) - float(on)) > 1e-6:
+                    parity_passed = False
+                    failed_features.append(f)
             elif off != on:
                 parity_passed = False
+                failed_features.append(f)
 
-        # UI RENDER
+        # --- UI RENDER ---
         st.markdown("### Feature Store Lookup")
         c1, c2 = st.columns(2)
         with c1:
@@ -163,7 +176,7 @@ if run_btn:
         if parity_passed:
             st.success(f"✅ **Parity Verified.** Offline and Online values match exactly for `{selected_customer}`.")
         else:
-            st.error("❌ **Parity Failed.** Train/Serve Skew detected! Pipeline halted.")
+            st.error(f"❌ **Parity Failed.** Train/Serve Skew detected! Mismatch in: {', '.join(failed_features)}")
 
         st.divider()
 
@@ -177,13 +190,15 @@ if run_btn:
             risk_score += 30
             triggers.append("High 1H Velocity")
             
-        # Rule 2: Amount Deviation (FIXED)
+        # Rule 2: Amount Deviation
         avg_amt = online_features.get('avg_amount_7d', 100)
+        if avg_amt is None: avg_amt = 100 # fallback if missing
+        
         if transaction_amount > avg_amt * 5:
-            risk_score += 60  # Instant block if > 5x average
+            risk_score += 60
             triggers.append("Amount > 5x 7-day Avg")
         elif transaction_amount > avg_amt * 2:
-            risk_score += 30  # Flag if > 2x average
+            risk_score += 30
             triggers.append("Amount > 2x 7-day Avg")
             
         # Rule 3: IP Risk
