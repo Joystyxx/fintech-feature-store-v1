@@ -180,20 +180,22 @@ if run_btn:
 
         st.divider()
 
-        # MODEL INFERENCE
+        # --- MODEL INFERENCE (None-Safe Rules Engine) ---
         st.markdown("### Model Inference")
         risk_score = 0
         triggers = []
         
+        # Safely extract values with fallbacks
+        txn_count = online_features.get('txn_count_1h') or 0
+        avg_amt = online_features.get('avg_amount_7d') or 100.0
+        ip_risk = online_features.get('ip_risk_score') or 0.0
+
         # Rule 1: Velocity
-        if online_features.get('txn_count_1h', 0) > 3: 
+        if txn_count > 3: 
             risk_score += 30
             triggers.append("High 1H Velocity")
             
         # Rule 2: Amount Deviation
-        avg_amt = online_features.get('avg_amount_7d', 100)
-        if avg_amt is None: avg_amt = 100 # fallback if missing
-        
         if transaction_amount > avg_amt * 5:
             risk_score += 60
             triggers.append("Amount > 5x 7-day Avg")
@@ -202,7 +204,7 @@ if run_btn:
             triggers.append("Amount > 2x 7-day Avg")
             
         # Rule 3: IP Risk
-        if online_features.get('ip_risk_score', 0) > 0.5: 
+        if ip_risk > 0.5: 
             risk_score += 30
             triggers.append("High IP Risk Score")
 
